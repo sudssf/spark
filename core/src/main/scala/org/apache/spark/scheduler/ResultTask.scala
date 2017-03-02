@@ -65,12 +65,15 @@ private[spark] class ResultTask[T, U](
     appId, appAttemptId)
   with Serializable {
 
+
   @transient private[this] val preferredLocs: Seq[TaskLocation] = {
     if (locs == null) Nil else locs.toSet.toSeq
   }
 
   override def runTask(context: TaskContext): U = {
     // Deserialize the RDD and the func using the broadcast variables.
+    val q = SparkEnv.get.conf.get("spark.app.name","unknown")
+    DebugMetrics.set(q, "ResultTask",jobId.getOrElse(-1),stageId)
     val threadMXBean = ManagementFactory.getThreadMXBean
     val deserializeStartTime = System.currentTimeMillis()
     val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
@@ -83,7 +86,6 @@ private[spark] class ResultTask[T, U](
     _executorDeserializeCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
       threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
     } else 0L
-
     func(context, rdd.iterator(partition, context))
   }
 

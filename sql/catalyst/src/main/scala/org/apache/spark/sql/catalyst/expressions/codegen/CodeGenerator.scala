@@ -17,20 +17,19 @@
 
 package org.apache.spark.sql.catalyst.expressions.codegen
 
-import java.io.ByteArrayInputStream
+import java.io.{ByteArrayInputStream, File, PrintWriter}
 import java.util.{Map => JavaMap}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
-
 import com.google.common.cache.{CacheBuilder, CacheLoader}
 import org.codehaus.janino.{ByteArrayClassLoader, ClassBodyEvaluator, SimpleCompiler}
 import org.codehaus.janino.util.ClassFile
-import scala.language.existentials
 
-import org.apache.spark.SparkEnv
+import scala.language.existentials
+import org.apache.spark.{DebugMetrics, SparkEnv}
 import org.apache.spark.internal.Logging
 import org.apache.spark.metrics.source.CodegenMetrics
 import org.apache.spark.sql.catalyst.InternalRow
@@ -886,6 +885,10 @@ object CodeGenerator extends Logging {
   /**
    * Compile the Java source code into a Java class, using Janino.
    */
+  var cnt = 0;
+  val executorId = SparkEnv.get.executorId;
+  var query = "NotDefined"
+
   def compile(code: CodeAndComment): GeneratedClass = {
     cache.get(code)
   }
@@ -994,13 +997,46 @@ object CodeGenerator extends Logging {
     .build(
       new CacheLoader[CodeAndComment, GeneratedClass]() {
         override def load(code: CodeAndComment): GeneratedClass = {
+          cnt += 1;
+          val q = DebugMetrics.getQuery()
+          val j = DebugMetrics.getJobId()
+          val s = DebugMetrics.getStageId()
+          val t = DebugMetrics.getTaskType()
+          val fname = s"${q}_jobid_${j}_stageid_${s}_${t}_${cnt}_execid_${executorId}"
+          var code1 : CodeAndComment = code;
+
+          try {
+            val source = scala.io.Source.fromFile(s"/tmp/catalyst-input/${fname}.java")
+            val lines = try source.mkString finally source.close()
+            code1 = new CodeAndComment(lines,Map[String,String]())
+            println(s"MADHU using Custom Java code for ${fname} executor id ${executorId}")
+          }
+          catch {
+            case _ : Throwable => {}
+          }
+
+
+
           val startTime = System.nanoTime()
-          val result = doCompile(code)
+          val result = doCompile(code1)
           val endTime = System.nanoTime()
           def timeMs: Double = (endTime - startTime).toDouble / 1000000
           CodegenMetrics.METRIC_SOURCE_CODE_SIZE.update(code.body.length)
           CodegenMetrics.METRIC_COMPILATION_TIME.update(timeMs.toLong)
-          logInfo(s"Code generated in $timeMs ms")
+
+          lazy val formatted = CodeFormatter.format(code1)
+
+         // if(executorId.equals("1"))
+          {
+            val writer = new PrintWriter(new File(s"/tmp/catalyst-output/${fname}.java" ))
+            writer.write(formatted)
+            writer.close()
+
+            val writer1 = new PrintWriter(new File(s"/tmp/catalyst-output/${fname}.stack" ))
+            new Exception("Stack trace").printStackTrace(writer1)
+            writer1.close()
+          }
+
           result
         }
       })
