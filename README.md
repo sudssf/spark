@@ -1,104 +1,18 @@
-# Apache Spark
+# WholeStageCodeGen Debug
 
-Spark is a fast and general cluster computing system for Big Data. It provides
-high-level APIs in Scala, Java, Python, and R, and an optimized engine that
-supports general computation graphs for data analysis. It also supports a
-rich set of higher-level tools including Spark SQL for SQL and DataFrames,
-MLlib for machine learning, GraphX for graph processing,
-and Spark Streaming for stream processing.
+WholeStageCodeGen/Catalyst dynamically generates java code while executing SQL queries. This introduces additional complexity when the developer tries to optimize/debug the execution flow. If any of the function in dynamically generated code pops up as hot(eg : processNext()), there is no code to refer back.
 
-<http://spark.apache.org/>
+This branch adds required debug code to help in this situtation. This will dump all dynamically generated code to /tmp/catalyst-output directory. The file name would be in the following format.
 
+q10_jobid_6_stageid_3_shuffleTask_6_execid_1.java     
 
-## Online Documentation
+* q10 - Application Name
+* 6   - Job Id
+* 3   - Stage id
+* 1   - Executor Id
+* shuffle/Result Task - TaskType
 
-You can find the latest Spark documentation, including a programming
-guide, on the [project web page](http://spark.apache.org/documentation.html).
-This README file only contains basic setup instructions.
+The developer needs to refer SparkUI for job & stage id map, and then he/she can refer the dynamically generated code for that stage. 
 
-## Building Spark
+To modify the dynamically generated code, developer need to modify the generated java file in previous run from catalyst-output directory and copy it to /tmp/catalyst-input directory. If WholeStageCodeGen finds a java file for the given job and stage id, then it will use that source code instead of generating a new code. This can be used for quick debugging and making some experiment.
 
-Spark is built using [Apache Maven](http://maven.apache.org/).
-To build Spark and its example programs, run:
-
-    build/mvn -DskipTests clean package
-
-(You do not need to do this if you downloaded a pre-built package.)
-
-You can build Spark using more than one thread by using the -T option with Maven, see ["Parallel builds in Maven 3"](https://cwiki.apache.org/confluence/display/MAVEN/Parallel+builds+in+Maven+3).
-More detailed documentation is available from the project site, at
-["Building Spark"](http://spark.apache.org/docs/latest/building-spark.html).
-
-For general development tips, including info on developing Spark using an IDE, see 
-[http://spark.apache.org/developer-tools.html](the Useful Developer Tools page).
-
-## Interactive Scala Shell
-
-The easiest way to start using Spark is through the Scala shell:
-
-    ./bin/spark-shell
-
-Try the following command, which should return 1000:
-
-    scala> sc.parallelize(1 to 1000).count()
-
-## Interactive Python Shell
-
-Alternatively, if you prefer Python, you can use the Python shell:
-
-    ./bin/pyspark
-
-And run the following command, which should also return 1000:
-
-    >>> sc.parallelize(range(1000)).count()
-
-## Example Programs
-
-Spark also comes with several sample programs in the `examples` directory.
-To run one of them, use `./bin/run-example <class> [params]`. For example:
-
-    ./bin/run-example SparkPi
-
-will run the Pi example locally.
-
-You can set the MASTER environment variable when running examples to submit
-examples to a cluster. This can be a mesos:// or spark:// URL,
-"yarn" to run on YARN, and "local" to run
-locally with one thread, or "local[N]" to run locally with N threads. You
-can also use an abbreviated class name if the class is in the `examples`
-package. For instance:
-
-    MASTER=spark://host:7077 ./bin/run-example SparkPi
-
-Many of the example programs print usage help if no params are given.
-
-## Running Tests
-
-Testing first requires [building Spark](#building-spark). Once Spark is built, tests
-can be run using:
-
-    ./dev/run-tests
-
-Please see the guidance on how to
-[run tests for a module, or individual tests](http://spark.apache.org/developer-tools.html#individual-tests).
-
-## A Note About Hadoop Versions
-
-Spark uses the Hadoop core library to talk to HDFS and other Hadoop-supported
-storage systems. Because the protocols have changed in different versions of
-Hadoop, you must build Spark against the same version that your cluster runs.
-
-Please refer to the build documentation at
-["Specifying the Hadoop Version"](http://spark.apache.org/docs/latest/building-spark.html#specifying-the-hadoop-version)
-for detailed guidance on building for a particular distribution of Hadoop, including
-building for particular Hive and Hive Thriftserver distributions.
-
-## Configuration
-
-Please refer to the [Configuration Guide](http://spark.apache.org/docs/latest/configuration.html)
-in the online documentation for an overview on how to configure Spark.
-
-## Contributing
-
-Please review the [Contribution to Spark guide](http://spark.apache.org/contributing.html)
-for information on how to get started contributing to the project.
