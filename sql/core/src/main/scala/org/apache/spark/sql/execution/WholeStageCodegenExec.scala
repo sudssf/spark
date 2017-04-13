@@ -17,7 +17,9 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.{broadcast, TaskContext}
+import java.io.{PrintWriter, StringWriter}
+
+import org.apache.spark.{DebugMetrics, SparkEnv, TaskContext, broadcast}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
@@ -336,8 +338,21 @@ case class WholeStageCodegenExec(child: SparkPlan) extends UnaryExecNode with Co
 
         ${ctx.declareAddedFunctions()}
 
-        protected void processNext() throws java.io.IOException {
+        private void processNext_MADHU() throws java.io.IOException {
+          /*
+          ${
+      val errors = new StringWriter()
+      val pw = new PrintWriter(errors)
+      new Exception("Stack trace").printStackTrace(pw);
+      pw.close()
+      errors.toString()
+    }
+          */
           ${code.trim}
+        }
+
+        protected void processNext() throws java.io.IOException {
+          processNext_MADHU();
         }
       }
       """.trim
@@ -369,7 +384,15 @@ case class WholeStageCodegenExec(child: SparkPlan) extends UnaryExecNode with Co
     assert(rdds.size <= 2, "Up to two input RDDs can be supported")
     if (rdds.length == 1) {
       rdds.head.mapPartitionsWithIndex { (index, iter) =>
-        val clazz = CodeGenerator.compile(cleanedSource)
+        val q = DebugMetrics.getQuery()
+        val j = DebugMetrics.getJobId()
+        val s = DebugMetrics.getStageId()
+        val t = DebugMetrics.getTaskType()
+        val executorId = SparkEnv.get.executorId;
+        val ustring = if(j>0 && s > 0) s"${q}_jobid_${j}_stageid_${s}_${t}_execid_${executorId}" else "unknown"
+        val newCodeBody = cleanedSource.body.replace("_MADHU",ustring)
+        val newCode = new CodeAndComment(newCodeBody,cleanedSource.comment)
+        val clazz = CodeGenerator.compile(newCode)
         val buffer = clazz.generate(references).asInstanceOf[BufferedRowIterator]
         buffer.init(index, Array(iter))
         new Iterator[InternalRow] {
@@ -388,7 +411,16 @@ case class WholeStageCodegenExec(child: SparkPlan) extends UnaryExecNode with Co
         // a small hack to obtain the correct partition index
       }.mapPartitionsWithIndex { (index, zippedIter) =>
         val (leftIter, rightIter) = zippedIter.next()
-        val clazz = CodeGenerator.compile(cleanedSource)
+        val q = DebugMetrics.getQuery()
+        val j = DebugMetrics.getJobId()
+        val s = DebugMetrics.getStageId()
+        val t = DebugMetrics.getTaskType()
+        val executorId = SparkEnv.get.executorId;
+        val ustring = if(j>0 && s > 0) s"${q}_jobid_${j}_stageid_${s}_${t}_execid_${executorId}" else "unknown"
+        val newCodeBody = cleanedSource.body.replace("_MADHU",ustring)
+        val newCode = new CodeAndComment(newCodeBody,cleanedSource.comment)
+        val clazz = CodeGenerator.compile(newCode)
+        //val clazz = CodeGenerator.compile(cleanedSource)
         val buffer = clazz.generate(references).asInstanceOf[BufferedRowIterator]
         buffer.init(index, Array(leftIter, rightIter))
         new Iterator[InternalRow] {
