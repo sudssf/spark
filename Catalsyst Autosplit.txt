@@ -1,0 +1,621 @@
+https://github.com/kavanabhat/spark/commit/803dd8744e7b4592d1f8169de6f63d2505b92fed.patch
+
+From 803dd8744e7b4592d1f8169de6f63d2505b92fed Mon Sep 17 00:00:00 2001
+From: Kavana Bhat <Kavana.bhat@in.ibm.com>
+Date: Fri, 14 Sep 2018 15:52:04 +0530
+Subject: [PATCH] Catalsyst Autosplit
+
+---
+ .../scala/org/apache/spark/DebugMetrics.scala |  28 +++
+ .../apache/spark/scheduler/ResultTask.scala   |   3 +
+ .../spark/scheduler/ShuffleMapTask.scala      |   3 +
+ .../catalyst/expressions/BoundAttribute.scala |   7 +-
+ .../expressions/codegen/CodeGenerator.scala   |  61 +++++
+ .../sql/execution/ColumnarBatchScan.scala     |   9 +-
+ .../joins/BroadcastHashJoinExec.scala         | 218 ++++++++++++------
+ .../execution/joins/SortMergeJoinExec.scala   |  23 +-
+ 8 files changed, 270 insertions(+), 82 deletions(-)
+ create mode 100644 core/src/main/scala/org/apache/spark/DebugMetrics.scala
+
+diff --git a/core/src/main/scala/org/apache/spark/DebugMetrics.scala b/core/src/main/scala/org/apache/spark/DebugMetrics.scala
+new file mode 100644
+index 000000000000..d9512b5775c8
+--- /dev/null
++++ b/core/src/main/scala/org/apache/spark/DebugMetrics.scala
+@@ -0,0 +1,28 @@
++package org.apache.spark
++
++/**
++  * Created by madhusudanan on 2/23/17.
++  */
++object DebugMetrics {
++
++  case class jobdetails(query: String, taskType : String, jobId : Int, stageId : Int, taskId: Long)
++  val s = new ThreadLocal[jobdetails];
++
++  def get() = {
++    if(s.get() == null)
++      jobdetails("unknown","unknown",-1,-1,-1)
++    else
++      s.get()
++  }
++
++  def set(query : String, taskType : String, jobId : Int, stageId : Int, taskId : Long) = {
++    s.set(jobdetails(query,taskType,jobId,stageId,taskId))
++  }
++
++  def getTaskType() = get().taskType
++  def getJobId() = get.jobId
++  def getStageId() = get.stageId
++  def getQuery() = get().query
++  def getTaskId() = get().taskId
++
++}
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/ResultTask.scala b/core/src/main/scala/org/apache/spark/scheduler/ResultTask.scala
+index e36c759a4255..bb9e83502ddc 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/ResultTask.scala
++++ b/core/src/main/scala/org/apache/spark/scheduler/ResultTask.scala
+@@ -71,6 +71,9 @@ private[spark] class ResultTask[T, U](
+ 
+   override def runTask(context: TaskContext): U = {
+     // Deserialize the RDD and the func using the broadcast variables.
++    val q = SparkEnv.get.conf.get("spark.app.name","unknown")
++    DebugMetrics.set(q, "ResultTask",jobId.getOrElse(-1),stageId,context.taskAttemptId())
++    println(s"ResultTask ${jobId} ${stageId} ${outputId} ${context.taskAttemptId}")
+     val threadMXBean = ManagementFactory.getThreadMXBean
+     val deserializeStartTime = System.currentTimeMillis()
+     val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+diff --git a/core/src/main/scala/org/apache/spark/scheduler/ShuffleMapTask.scala b/core/src/main/scala/org/apache/spark/scheduler/ShuffleMapTask.scala
+index 7a25c47e2cab..9841678c99fd 100644
+--- a/core/src/main/scala/org/apache/spark/scheduler/ShuffleMapTask.scala
++++ b/core/src/main/scala/org/apache/spark/scheduler/ShuffleMapTask.scala
+@@ -76,6 +76,9 @@ private[spark] class ShuffleMapTask(
+ 
+   override def runTask(context: TaskContext): MapStatus = {
+     // Deserialize the RDD using the broadcast variable.
++    val q = SparkEnv.get.conf.get("spark.app.name","unknown")
++    DebugMetrics.set(q,"shuffleTask",jobId.getOrElse(-1),stageId, context.taskAttemptId())
++    println(s"ShuffleTask ${jobId} ${stageId} ${context.taskAttemptId()}")
+     val threadMXBean = ManagementFactory.getThreadMXBean
+     val deserializeStartTime = System.currentTimeMillis()
+     val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/BoundAttribute.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/BoundAttribute.scala
+index 7d16118c9d59..e0880a632848 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/BoundAttribute.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/BoundAttribute.scala
+@@ -69,9 +69,12 @@ case class BoundReference(ordinal: Int, dataType: DataType, nullable: Boolean)
+       oev.code = ""
+       ev.copy(code = code)
+     } else if (nullable) {
++      ctx.addMutableState("boolean", ev.isNull, "");
++      ctx.addMutableState(javaType, ev.value, "");
+       ev.copy(code = s"""
+-        boolean ${ev.isNull} = ${ctx.INPUT_ROW}.isNullAt($ordinal);
+-        $javaType ${ev.value} = ${ev.isNull} ? ${ctx.defaultValue(dataType)} : ($value);""")
++        // BoundAttribute.scala doGenCode
++        ${ev.isNull} = ${ctx.INPUT_ROW}.isNullAt($ordinal);
++        ${ev.value} = ${ev.isNull} ? ${ctx.defaultValue(dataType)} : ($value);""")
+     } else {
+       ev.copy(code = s"""$javaType ${ev.value} = $value;""", isNull = "false")
+     }
+diff --git a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/codegen/CodeGenerator.scala b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/codegen/CodeGenerator.scala
+index 50112d50300c..cc6d455056f7 100644
+--- a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/codegen/CodeGenerator.scala
++++ b/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/codegen/CodeGenerator.scala
+@@ -18,6 +18,7 @@
+ package org.apache.spark.sql.catalyst.expressions.codegen
+ 
+ import java.io.ByteArrayInputStream
++import java.io.{ByteArrayInputStream, File, PrintWriter, StringWriter}
+ import java.util.{Map => JavaMap}
+ 
+ import scala.collection.JavaConverters._
+@@ -34,6 +35,7 @@ import org.codehaus.janino.{ByteArrayClassLoader, ClassBodyEvaluator, JaninoRunt
+ import org.codehaus.janino.util.ClassFile
+ 
+ import org.apache.spark.{SparkEnv, TaskContext, TaskKilledException}
++import org.apache.spark.{DebugMetrics, SparkEnv}
+ import org.apache.spark.executor.InputMetrics
+ import org.apache.spark.internal.Logging
+ import org.apache.spark.metrics.source.CodegenMetrics
+@@ -929,6 +931,11 @@ abstract class CodeGenerator[InType <: AnyRef, OutType <: AnyRef] extends Loggin
+ }
+ 
+ object CodeGenerator extends Logging {
++
++
++  var cnt = 0;
++  val executorId = SparkEnv.get.executorId;
++  var query = "NotDefined"
+   /**
+    * Compile the Java source code into a Java class, using Janino.
+    */
+@@ -1053,6 +1060,60 @@ object CodeGenerator extends Logging {
+     .build(
+       new CacheLoader[CodeAndComment, GeneratedClass]() {
+         override def load(code: CodeAndComment): GeneratedClass = {
++          cnt += 1;
++          val q = DebugMetrics.getQuery()
++          val j = DebugMetrics.getJobId()
++          val s = DebugMetrics.getStageId()
++          val t = DebugMetrics.getTaskType()
++          val taskId = DebugMetrics.getTaskId()
++          val hc = code.hashCode()
++          val fname = s"${q}_jobid_${j}_stageid_${s}_taskid_${taskId}_${t}_${cnt}_execid_${executorId}_${hc}"
++          var code1 : CodeAndComment = code;
++
++          try {
++            def getFilesMatchingRegex(dir: String, regex: util.matching.Regex) = {
++              new java.io.File(dir).listFiles
++                .filter(file => regex.findFirstIn(file.getName).isDefined)
++                .head
++            }
++            val regexp = ".*" + code1.hashCode() +  "\\.java"
++            //println(s"Regular exp for ${fname} is ${regexp}")
++            val mFile = getFilesMatchingRegex("/tmp/catalyst-input", regexp.r)
++            val mFileName = mFile.getPath()
++            //println(s"Kavana ${fname} matched ${mFileName}")
++            val source = scala.io.Source.fromFile(mFile)
++            val lines = try source.mkString finally source.close()
++            code1 = new CodeAndComment(lines,Map[String,String]())
++            val newHc = code1.hashCode()
++            //println(s"MADHU using Custom Java code for ${fname} with HashCode ${newHc}")
++          }
++          catch {
++            case _ : Throwable => {}
++          }
++
++
++
++          val hc1 = code1.hashCode()
++
++          lazy val formatted = CodeFormatter.format(code1)
++
++          //println(s"Kavana cksum for ${fname} is ${hc}")
++          //val sw = new StringWriter
++          //new Exception("Stack trace").printStackTrace(new PrintWriter(sw))
++          //println(sw.toString)
++
++         // if(executorId.equals("1"))
++          {
++            val writer = new PrintWriter(new File(s"/tmp/catalyst-output/${fname}.java" ))
++            writer.write(formatted)
++            writer.close()
++
++            val writer1 = new PrintWriter(new File(s"/tmp/catalyst-output/${fname}.stack" ))
++            new Exception("Stack trace").printStackTrace(writer1)
++            writer1.close()
++          }
++
++
+           val startTime = System.nanoTime()
+           val result = doCompile(code)
+           val endTime = System.nanoTime()
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/ColumnarBatchScan.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/ColumnarBatchScan.scala
+index e86116680a57..4a878d4f7064 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/ColumnarBatchScan.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/ColumnarBatchScan.scala
+@@ -53,9 +53,11 @@ private[sql] trait ColumnarBatchScan extends CodegenSupport {
+     val valueVar = ctx.freshName("value")
+     val str = s"columnVector[$columnVar, $ordinal, ${dataType.simpleString}]"
+     val code = s"${ctx.registerComment(str)}\n" + (if (nullable) {
++    ctx.addMutableState("boolean", isNullVar, "")
++    ctx.addMutableState(javaType, valueVar, "")
+       s"""
+-        boolean $isNullVar = $columnVar.isNullAt($ordinal);
+-        $javaType $valueVar = $isNullVar ? ${ctx.defaultValue(dataType)} : ($value);
++        $isNullVar = $columnVar.isNullAt($ordinal);
++        $valueVar = $isNullVar ? ${ctx.defaultValue(dataType)} : ($value);
+       """
+     } else {
+       s"$javaType $valueVar = $value;"
+@@ -111,6 +113,7 @@ private[sql] trait ColumnarBatchScan extends CodegenSupport {
+     val columnsBatchInput = (output zip colVars).map { case (attr, colVar) =>
+       genCodeColumnVector(ctx, colVar, rowidx, attr.dataType, attr.nullable)
+     }
++    ctx.addMutableState("int", rowidx, s"$rowidx = 0;")
+     val localIdx = ctx.freshName("localIdx")
+     val localEnd = ctx.freshName("localEnd")
+     val numRows = ctx.freshName("numRows")
+@@ -127,7 +130,7 @@ private[sql] trait ColumnarBatchScan extends CodegenSupport {
+        |  int $numRows = $batch.numRows();
+        |  int $localEnd = $numRows - $idx;
+        |  for (int $localIdx = 0; $localIdx < $localEnd; $localIdx++) {
+-       |    int $rowidx = $idx + $localIdx;
++       |    $rowidx = $idx + $localIdx;
+        |    ${consume(ctx, columnsBatchInput).trim}
+        |    $shouldStop
+        |  }
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
+index 69715ab1f675..032011fa4d3d 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala
+@@ -29,7 +29,7 @@ import org.apache.spark.sql.execution.{BinaryExecNode, CodegenSupport, SparkPlan
+ import org.apache.spark.sql.execution.metric.SQLMetrics
+ import org.apache.spark.sql.types.LongType
+ 
+-/**
++/*a
+  * Performs an inner hash join of two child relations.  When the output RDD of this operator is
+  * being constructed, a Spark job is asynchronously started to calculate the values for the
+  * broadcast relation.  This data is then placed in a Spark broadcast variable.  The streamed
+@@ -90,6 +90,54 @@ case class BroadcastHashJoinExec(
+     }
+   }
+ 
++  /**
++    * Generate the (non-equi) condition used to filter joined rows. This is used in Inner, Left Semi
++    * and Left Anti joins.
++    */
++  private def getJoinCondition(
++                                ctx: CodegenContext,
++                                input: Seq[ExprCode],
++                                anti: Boolean = false): (String, String, Seq[ExprCode]) = {
++    val matched = ctx.freshName("matched")
++    val buildVars = genBuildSideVars(ctx, matched)
++    val checkCondition = if (condition.isDefined) {
++      val expr = condition.get
++      // evaluate the variables from build side that used by condition
++      val eval = evaluateRequiredVariables(buildPlan.output, buildVars, expr.references)
++      // filter the output via condition
++      ctx.currentVars = input ++ buildVars
++      val ev =
++        BindReferences.bindReference(expr, streamedPlan.output ++ buildPlan.output).genCode(ctx)
++      val skipRow = if (!anti) {
++        s"${ev.isNull} || !${ev.value}"
++      } else {
++        s"!${ev.isNull} && ${ev.value}"
++      }
++
++      val checkRoutine = ctx.freshName("check")
++      ctx.addNewFunction(checkRoutine,
++        s"""
++           |private boolean $checkRoutine() throws java.io.IOException {
++           |   $eval
++           |   ${ev.code}
++           |   if ($skipRow) return true;
++               else return false;
++           |}""".stripMargin)
++
++      s"""
++         |//check condition
++         |if ($checkRoutine() == true) continue;
++         |
++       """.stripMargin
++    } else if (anti) {
++      "continue;"
++    } else {
++      ""
++    }
++    (matched, checkCondition, buildVars)
++  }
++
++
+   /**
+    * Returns a tuple of Broadcast of HashedRelation and the variable name for it.
+    */
+@@ -154,45 +202,10 @@ case class BroadcastHashJoinExec(
+     }
+   }
+ 
+-  /**
+-   * Generate the (non-equi) condition used to filter joined rows. This is used in Inner, Left Semi
+-   * and Left Anti joins.
+-   */
+-  private def getJoinCondition(
+-      ctx: CodegenContext,
+-      input: Seq[ExprCode],
+-      anti: Boolean = false): (String, String, Seq[ExprCode]) = {
+-    val matched = ctx.freshName("matched")
+-    val buildVars = genBuildSideVars(ctx, matched)
+-    val checkCondition = if (condition.isDefined) {
+-      val expr = condition.get
+-      // evaluate the variables from build side that used by condition
+-      val eval = evaluateRequiredVariables(buildPlan.output, buildVars, expr.references)
+-      // filter the output via condition
+-      ctx.currentVars = input ++ buildVars
+-      val ev =
+-        BindReferences.bindReference(expr, streamedPlan.output ++ buildPlan.output).genCode(ctx)
+-      val skipRow = if (!anti) {
+-        s"${ev.isNull} || !${ev.value}"
+-      } else {
+-        s"!${ev.isNull} && ${ev.value}"
+-      }
+-      s"""
+-         |$eval
+-         |${ev.code}
+-         |if ($skipRow) continue;
+-       """.stripMargin
+-    } else if (anti) {
+-      "continue;"
+-    } else {
+-      ""
+-    }
+-    (matched, checkCondition, buildVars)
+-  }
+ 
+   /**
+-   * Generates the code for Inner join.
+-   */
++    * Generates the code for Inner join.
++    */
+   private def codegenInner(ctx: CodegenContext, input: Seq[ExprCode]): String = {
+     val (broadcastRelation, relationTerm) = prepareBroadcast(ctx)
+     val (keyEv, anyNull) = genStreamSideJoinKey(ctx, input)
+@@ -203,38 +216,66 @@ case class BroadcastHashJoinExec(
+       case BuildLeft => buildVars ++ input
+       case BuildRight => input ++ buildVars
+     }
++
++    println("codegenInner -" + resultVars)
++
++    ctx.addMutableState("UnsafeRow", matched, "")
++
+     if (broadcastRelation.value.keyIsUnique) {
++      val subroutine = ctx.freshName("genJK")
++      ctx.addNewFunction(subroutine,
++        s"""
++           |private void $subroutine() throws java.io.IOException {
++           |   // generate join key for stream side
++           |   ${keyEv.code}
++           |   // find matches from HashedRelation
++           |   $matched = $anyNull ? null: (UnsafeRow)$relationTerm.getValue(${keyEv.value});
++           |}""".stripMargin)
++
+       s"""
+-         |// generate join key for stream side
+-         |${keyEv.code}
+-         |// find matches from HashedRelation
+-         |UnsafeRow $matched = $anyNull ? null: (UnsafeRow)$relationTerm.getValue(${keyEv.value});
++         |//codegenInner
++         |$subroutine();
+          |if ($matched == null) continue;
+          |$checkCondition
+          |$numOutput.add(1);
+          |${consume(ctx, resultVars)}
+        """.stripMargin
+ 
+-    } else {
++    } else  {
+       ctx.copyResult = true
+       val matches = ctx.freshName("matches")
+       val iteratorCls = classOf[Iterator[UnsafeRow]].getName
++      ctx.addMutableState(iteratorCls, matches, "")
++      val subroutine = ctx.freshName("genJK")
++      ctx.addNewFunction(subroutine,
++        s"""
++           |private void $subroutine() throws java.io.IOException {
++           |   // generate join key for stream side
++           |   ${keyEv.code}
++           |   // find matches from HashRelation
++           |   $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
++           |}""".stripMargin)
++      val subroutine1 = ctx.freshName("wloop")
++      ctx.addNewFunction(subroutine1,
++        s"""
++           |private void $subroutine1() throws java.io.IOException {
++           |   while ($matches.hasNext()) {
++           |      $matched = (UnsafeRow) $matches.next();
++           |      $checkCondition
++           |      $numOutput.add(1);
++           |      ${consume(ctx, resultVars)}
++           |   }
++           |}""".stripMargin)
+       s"""
+-         |// generate join key for stream side
+-         |${keyEv.code}
+-         |// find matches from HashRelation
+-         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
++         |//codegenInner
++         |$subroutine();
+          |if ($matches == null) continue;
+-         |while ($matches.hasNext()) {
+-         |  UnsafeRow $matched = (UnsafeRow) $matches.next();
+-         |  $checkCondition
+-         |  $numOutput.add(1);
+-         |  ${consume(ctx, resultVars)}
+-         |}
++         |$subroutine1();
+        """.stripMargin
+     }
+   }
+ 
++
+   /**
+    * Generates the code for left or right outer join.
+    */
+@@ -257,8 +298,8 @@ case class BroadcastHashJoinExec(
+       s"""
+          |boolean $conditionPassed = true;
+          |${eval.trim}
++         |${ev.code}
+          |if ($matched != null) {
+-         |  ${ev.code}
+          |  $conditionPassed = !${ev.isNull} && ${ev.value};
+          |}
+        """.stripMargin
+@@ -271,11 +312,19 @@ case class BroadcastHashJoinExec(
+       case BuildRight => input ++ buildVars
+     }
+     if (broadcastRelation.value.keyIsUnique) {
++      ctx.addMutableState("UnsafeRow", matched, s"$matched = null;")
++      val subroutine = ctx.freshName("genJK")
++      ctx.addNewFunction(subroutine,
++        s"""
++           |private void $subroutine() throws java.io.IOException {
++           |   // generate join key for stream side
++           |   ${keyEv.code}
++           |   // find matches from HashedRelation
++           |   $matched = $anyNull ? null: (UnsafeRow)$relationTerm.getValue(${keyEv.value});
++           |}""".stripMargin)
+       s"""
+-         |// generate join key for stream side
+-         |${keyEv.code}
+-         |// find matches from HashedRelation
+-         |UnsafeRow $matched = $anyNull ? null: (UnsafeRow)$relationTerm.getValue(${keyEv.value});
++         |// codegenOuter
++         |$subroutine();
+          |${checkCondition.trim}
+          |if (!$conditionPassed) {
+          |  $matched = null;
+@@ -291,11 +340,19 @@ case class BroadcastHashJoinExec(
+       val matches = ctx.freshName("matches")
+       val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+       val found = ctx.freshName("found")
++      ctx.addMutableState(iteratorCls, matches, s"$matches = null;")
++      val subroutine = ctx.freshName("genJK")
++      ctx.addNewFunction(subroutine,
++        s"""
++           |private void $subroutine() throws java.io.IOException {
++           |   // generate join key for stream side
++           |   ${keyEv.code}
++           |   // find matches from HashRelation
++           |   $iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
++           |}""".stripMargin)
+       s"""
+-         |// generate join key for stream side
+-         |${keyEv.code}
+-         |// find matches from HashRelation
+-         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
++         |//codegenOuter
++         |$subroutine()
+          |boolean $found = false;
+          |// the last iteration of this loop is to emit an empty row if there is no matched rows.
+          |while ($matches != null && $matches.hasNext() || !$found) {
+@@ -320,11 +377,19 @@ case class BroadcastHashJoinExec(
+     val (matched, checkCondition, _) = getJoinCondition(ctx, input)
+     val numOutput = metricTerm(ctx, "numOutputRows")
+     if (broadcastRelation.value.keyIsUnique) {
++      ctx.addMutableState("UnsafeRow", matched, s"$matched = null;")
++      val subroutine = ctx.freshName("genJK")
++      ctx.addNewFunction(subroutine,
++        s"""
++           |private void $subroutine() throws java.io.IOException {
++           |   // generate join key for stream side
++           |   ${keyEv.code}
++           |   // find matches from HashedRelation
++           |   $matched = $anyNull ? null: (UnsafeRow)$relationTerm.getValue(${keyEv.value});
++           |}""".stripMargin)
+       s"""
+-         |// generate join key for stream side
+-         |${keyEv.code}
+-         |// find matches from HashedRelation
+-         |UnsafeRow $matched = $anyNull ? null: (UnsafeRow)$relationTerm.getValue(${keyEv.value});
++         |//codegenSemi
++         |$subroutine()
+          |if ($matched == null) continue;
+          |$checkCondition
+          |$numOutput.add(1);
+@@ -334,11 +399,19 @@ case class BroadcastHashJoinExec(
+       val matches = ctx.freshName("matches")
+       val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+       val found = ctx.freshName("found")
++      ctx.addMutableState(iteratorCls, matches, s"$matches = null;")
++      val subroutine = ctx.freshName("genJK")
++      ctx.addNewFunction(subroutine,
++        s"""
++           |private void $subroutine() throws java.io.IOException {
++           |   // generate join key for stream side
++           |   ${keyEv.code}
++           |   // find matches from HashRelation
++           |   $iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
++           |}""".stripMargin)
+       s"""
+-         |// generate join key for stream side
+-         |${keyEv.code}
+-         |// find matches from HashRelation
+-         |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
++         |//codegenSemi
++         |$subroutine()
+          |if ($matches == null) continue;
+          |boolean $found = false;
+          |while (!$found && $matches.hasNext()) {
+@@ -365,6 +438,7 @@ case class BroadcastHashJoinExec(
+ 
+     if (uniqueKeyCodePath) {
+       s"""
++         |//codegenAnti
+          |// generate join key for stream side
+          |${keyEv.code}
+          |// Check if the key has nulls.
+@@ -384,6 +458,7 @@ case class BroadcastHashJoinExec(
+       val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+       val found = ctx.freshName("found")
+       s"""
++         |//codegenAnti
+          |// generate join key for stream side
+          |${keyEv.code}
+          |// Check if the key has nulls.
+@@ -438,6 +513,7 @@ case class BroadcastHashJoinExec(
+     val resultVar = input ++ Seq(ExprCode("", "false", existsVar))
+     if (broadcastRelation.value.keyIsUnique) {
+       s"""
++         |//codegenExistence
+          |// generate join key for stream side
+          |${keyEv.code}
+          |// find matches from HashedRelation
+@@ -453,6 +529,7 @@ case class BroadcastHashJoinExec(
+       val matches = ctx.freshName("matches")
+       val iteratorCls = classOf[Iterator[UnsafeRow]].getName
+       s"""
++         |//codegenExistence
+          |// generate join key for stream side
+          |${keyEv.code}
+          |// find matches from HashRelation
+@@ -470,3 +547,4 @@ case class BroadcastHashJoinExec(
+     }
+   }
+ }
++
+diff --git a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
+index 70dada8b63ae..96ff0c43c10f 100644
+--- a/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
++++ b/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
+@@ -579,6 +579,7 @@ case class SortMergeJoinExec(
+     val (beforeLoop, condCheck) = if (condition.isDefined) {
+       // Split the code of creating variables based on whether it's used by condition or not.
+       val loaded = ctx.freshName("loaded")
++      ctx.addMutableState("boolean", loaded, s"$loaded = false;")
+       val (leftBefore, leftAfter) = splitVarsByCondition(left.output, leftVars)
+       val (rightBefore, rightAfter) = splitVarsByCondition(right.output, rightVars)
+       // Generate code for condition
+@@ -586,7 +587,7 @@ case class SortMergeJoinExec(
+       val cond = BindReferences.bindReference(condition.get, output).genCode(ctx)
+       // evaluate the columns those used by condition before loop
+       val before = s"""
+-           |boolean $loaded = false;
++           |$loaded = false;
+            |$leftBefore
+          """.stripMargin
+ 
+@@ -605,16 +606,24 @@ case class SortMergeJoinExec(
+       (evaluateVariables(leftVars), "")
+     }
+ 
++    val forLoop_sub = ctx.freshName("forLoop")
++    ctx.addNewFunction(forLoop_sub,
++      s"""
++         |private void $forLoop_sub(scala.collection.Iterator<UnsafeRow> iterator) throws java.io.IOException {
++         |  while ($iterator.hasNext()) {
++         |    InternalRow $rightRow = (InternalRow) $iterator.next(); 
++         |    ${condCheck.trim}
++         |    $numOutput.add(1);
++         |    ${consume(ctx, leftVars ++ rightVars)}
++         |  }
++         |}""".stripMargin)
++
++
+     s"""
+        |while (findNextInnerJoinRows($leftInput, $rightInput)) {
+        |  ${beforeLoop.trim}
+        |  scala.collection.Iterator<UnsafeRow> $iterator = $matches.generateIterator();
+-       |  while ($iterator.hasNext()) {
+-       |    InternalRow $rightRow = (InternalRow) $iterator.next();
+-       |    ${condCheck.trim}
+-       |    $numOutput.add(1);
+-       |    ${consume(ctx, leftVars ++ rightVars)}
+-       |  }
++       |  $forLoop_sub($iterator);
+        |  if (shouldStop()) return;
+        |}
+      """.stripMargin
